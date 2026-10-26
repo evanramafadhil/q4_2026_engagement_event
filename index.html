@@ -234,6 +234,14 @@ body.is-deck:not(.chrome-on) { cursor: none; }
 .vb-input { width: 100%; display: block; font: inherit; font-size: 30px; font-weight: 700; padding: 14px 16px 16px; text-align: center; color: var(--line); background: #fff; border: 0; border-radius: 0; outline-offset: -6px; }
 .vb-input::placeholder { color: #8DA7A9; font-weight: 500; }
 .vb-input:disabled { opacity: .6; }
+.vb { position: relative; }
+.suggest { margin-top: 4px; background: #fff; color: var(--line); border: 3px solid var(--line); border-radius: 14px; box-shadow: 0 5px 0 rgba(0,0,0,.35); overflow: hidden; }
+.suggest button { display: block; width: 100%; padding: 8px 14px; text-align: left; font-size: 20px; font-weight: 600; color: var(--line); background: #fff; border: 0; border-bottom: 2px solid #D5E7E3; border-radius: 0; }
+.suggest button:last-child { border-bottom: 0; }
+.suggest button:hover, .suggest button:focus-visible { background: var(--sun); outline-offset: -4px; }
+.suggest .none { margin: 0; padding: 10px 14px; font-size: 16px; line-height: 1.35; color: #4F7378; }
+.vb-change { align-self: flex-start; padding: 2px 0; font: inherit; font-size: 16px; font-weight: 600; color: #fff; background: none; border: 0; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.vb-change:hover { color: var(--sun); }
 .nametag.locked .vb-input { background: #F1FAF9; cursor: default; }
 .nametag.locked:focus-within { transform: rotate(-1.8deg); }
 .vb-status { margin: 4px 2px 0; min-height: 48px; font-size: 18px; line-height: 1.3; font-weight: 600; }
@@ -590,19 +598,24 @@ const CONFIG = {
   // Firebase Realtime Database URL, no trailing slash. See README.md.
   // Leave empty for demo mode (data stays in this browser; tabs stay in sync).
   // Example: 'https://my-project-default-rtdb.firebaseio.com'
-  firebaseUrl: 'https://console.firebase.google.com/u/2/project/q4-engagement-event/database/q4-engagement-event-default-rtdb/data/~2F',
+  firebaseUrl: 'https://q4-engagement-event-default-rtdb.asia-southeast1.firebasedatabase.app/',
 
   // Voting closes automatically at this moment (ISO 8601 with a UTC offset).
   // 30 October 2026, 23:59 in UTC+7. Leave '' for no deadline.
   // If you change it, also change the number in the database rules (see README.md).
   votingCloses: '2026-10-30T23:59:00+07:00',
 
-  // Who may vote (only applies once firebaseUrl is set):
-  //   true  = every invited person votes with their OWN personal link (?k=...). The name is locked to the link,
-  //           so nobody can vote twice or as someone else, even in a private window. Create the links with
-  //           participants.html (see README.md).
-  //   false = anyone with the deck link can vote and type any name (one vote per browser only).
-  requirePersonalLink: true,
+  // How people prove who they are (only applies once firebaseUrl is set):
+  //   'roster' = everyone uses the SAME deck link, types a keyword of their name and picks themselves from the invited
+  //              list. The first browser to vote as a name locks that name, so a private window cannot vote again.
+  //              Needs Anonymous sign-in and firebaseApiKey (see README.md).
+  //   'links'  = every invited person gets their OWN personal link (?k=...). Strictest, but you send each link separately.
+  //   'open'   = anyone can type any name (one vote per browser only).
+  identity: 'roster',
+
+  // Firebase "Web API key" (Firebase console > Project settings > General). Needed for identity 'roster'.
+  // It is not a secret: it only tells Firebase which project to talk to.
+  firebaseApiKey: '',
 
   // How often (ms) results and voting status refresh.
   pollInterval: 2000
@@ -664,6 +677,48 @@ function leftText(ms) {
   if (m) return `${m} ${plural(m, 'minute', 'minutes')} ${sec} ${plural(sec, 'second', 'seconds')} left`;
   return `${sec} ${plural(sec, 'second', 'seconds')} left`;
 }
+
+/* Matching a typed keyword against the invited names */
+const strip = t => String(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+function nameParts(name) {
+  const m = /^(.*?)\s*\(([^)]*)\)\s*$/.exec(String(name));                         // "Budi (Finance)" -> base + detail
+  const base = m ? m[1] : String(name), detail = m ? strip(m[2]).replace(/[^a-z0-9]+/g, ' ').trim() : '';
+  return { tokens: strip(base).replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean), detail };
+}
+function lev(a, b) {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[a.length][b.length];
+}
+/* How well one typed word fits one word of a name (0 = not at all): exact > starts with > inside (valdi in rivaldi) > one typo */
+function wordScore(q, u) {
+  if (u === q) return 4;
+  if (u.startsWith(q)) return 3;
+  if (q.length >= 3 && u.includes(q)) return 2;
+  if (u.length >= 4 && q.includes(u)) return 2;
+  return q.length >= 5 && u.length >= 5 && lev(q, u) <= 1 ? 1.5 : 0;
+}
+function searchRoster(list, text, limit = 4) {
+  const qt = strip(text).replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  if (!qt.length || qt.join('').length < 2) return [];
+  const out = [];
+  list.forEach(p => {
+    let total = 0;
+    for (const t of qt) { let best = 0; for (const u of p.search) best = Math.max(best, wordScore(t, u)); if (!best) { total = 0; break; } total += best; }
+    if (total > 0) out.push({ p, total });
+  });
+  return out.sort((a, b) => b.total - a.total || a.p.name.localeCompare(b.p.name)).slice(0, limit).map(x => x.p);
+}
+const SETUP_MSG = {
+  nokey: 'Setup incomplete: the organizer needs to add the Firebase Web API key to the deck.',
+  badkey: 'Setup problem: the Firebase Web API key in the deck is not accepted.',
+  noanon: 'Setup incomplete: the organizer needs to turn on Anonymous sign-in in Firebase Authentication.',
+  refused: 'The database refused the request. The organizer needs to update the database rules.',
+  empty: 'The list of invited names is empty. The organizer needs to import it.',
+  error: 'Couldn’t reach the database. Retrying…'
+};
 
 const params = new URLSearchParams(location.search);
 const MODE = params.get('mode') === 'present' ? 'present' : 'view';
@@ -774,8 +829,8 @@ const Store = (() => {
   const key = k => 'poll-deck:' + CONFIG.deckId + ':' + k;
   const read = (k, d) => { try { const v = localStorage.getItem(key(k)); return v === null ? d : JSON.parse(v); } catch { return d; } };
   const write = (k, v) => { try { localStorage.setItem(key(k), JSON.stringify(v)); } catch { /* storage blocked */ } };
-  async function http(path, method, body) {
-    const res = await fetch(base + path + '.json', { method: method || 'GET', body, cache: 'no-store' });
+  async function http(path, method, body, tok) {
+    const res = await fetch(base + path + '.json' + (tok ? '?auth=' + encodeURIComponent(tok) : ''), { method: method || 'GET', body, cache: 'no-store' });
     if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
     return res.json();
   }
@@ -784,9 +839,13 @@ const Store = (() => {
     getSession: () => REMOTE ? http('/session') : Promise.resolve(read('session', null)),
     setSession: s => REMOTE ? http('/session', 'PUT', JSON.stringify(s)) : (write('session', s), Promise.resolve()),
     getAllowed: tok => REMOTE ? http('/allowed/' + tok) : Promise.resolve(null),
+    getRoster: () => REMOTE ? http('/roster') : Promise.resolve(null),
+    getBallot: id => REMOTE ? http('/ballots/' + id) : Promise.resolve(null),
+    getBinding: (uid, tok) => http('/byUid/' + uid, 'GET', undefined, tok),
+    putBinding: (uid, person, tok) => http('/byUid/' + uid, 'PUT', JSON.stringify(person), tok),
     getBallots: () => REMOTE ? http('/ballots') : Promise.resolve(read('ballots', null)),
-    putBallot: (voter, ballot) => {
-      if (REMOTE) return http('/ballots/' + voter, 'PUT', JSON.stringify(ballot));
+    putBallot: (voter, ballot, tok) => {
+      if (REMOTE) return http('/ballots/' + voter, 'PUT', JSON.stringify(ballot), tok);
       const m = read('ballots', null) || {}; m[voter] = ballot; write('ballots', m); return Promise.resolve();
     },
     resetBallots: () => REMOTE ? http('/ballots', 'DELETE') : (write('ballots', null), Promise.resolve()),
@@ -799,6 +858,35 @@ const Store = (() => {
       });
       write('ballots', m); return Promise.resolve();
     }
+  };
+})();
+
+/* Anonymous Firebase sign-in over REST. Each browser gets its own stable anonymous account; the database rules use
+   it to remember which browser claimed which name. (A private window is a new browser, so it gets a new account.) */
+const Auth = (() => {
+  const storeKey = 'poll-deck:' + CONFIG.deckId + ':auth';
+  const idBase = (CONFIG.authEndpoint || 'https://identitytoolkit.googleapis.com').replace(/\/+$/, '');
+  const tkBase = (CONFIG.tokenEndpoint || 'https://securetoken.googleapis.com').replace(/\/+$/, '');
+  let cur = null;
+  const load = () => { try { const v = JSON.parse(localStorage.getItem(storeKey)); return v && v.uid && v.refreshToken ? v : null; } catch { return null; } };
+  const save = v => { cur = v; try { localStorage.setItem(storeKey, JSON.stringify(v)); } catch { /* storage blocked */ } };
+  const fail = (res, data) => { const e = new Error('AUTH'); e.status = res.status; e.code = (data && data.error && data.error.message) || ''; return e; };
+  const expiry = s => Date.now() + Math.max(30, (Number(s) || 3600) - 60) * 1000;
+  async function signUp() {
+    if (!CONFIG.firebaseApiKey) { const e = new Error('NOKEY'); e.code = 'NO_API_KEY'; throw e; }
+    const res = await fetch(idBase + '/v1/accounts:signUp?key=' + encodeURIComponent(CONFIG.firebaseApiKey), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ returnSecureToken: true }) });
+    const d = await res.json().catch(() => ({})); if (!res.ok) throw fail(res, d);
+    save({ uid: d.localId, idToken: d.idToken, refreshToken: d.refreshToken, exp: expiry(d.expiresIn) });
+  }
+  async function refresh() {
+    const res = await fetch(tkBase + '/v1/token?key=' + encodeURIComponent(CONFIG.firebaseApiKey), { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(cur.refreshToken) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) { cur = null; try { localStorage.removeItem(storeKey); } catch { /* ignore */ } return signUp(); }       // the account no longer exists: start a new one
+    save({ uid: d.user_id, idToken: d.id_token, refreshToken: d.refresh_token, exp: expiry(d.expires_in) });
+  }
+  return {
+    has: () => !!load(),
+    async token() { cur = cur || load(); if (!cur) await signUp(); else if (Date.now() >= cur.exp) await refresh(); return { uid: cur.uid, token: cur.idToken }; }
   };
 })();
 
@@ -825,7 +913,8 @@ function startDeck() {
 
   /* ---- my ballot (this device) ---- */
   /* Who is voting? In personal-link mode the identity is the secret token in the link (?k=...). */
-  const LINK_MODE = REMOTE && CONFIG.requirePersonalLink;
+  const ID_MODE = REMOTE ? (['roster', 'links', 'open'].includes(CONFIG.identity) ? CONFIG.identity : 'roster') : 'open';
+  const LINK_MODE = ID_MODE === 'links', ROSTER_MODE = ID_MODE === 'roster';
   const TOKEN_RE = /^[A-Za-z0-9_-]{8,40}$/;
   const tokenKey = 'poll-deck:' + CONFIG.deckId + ':token';
   let token = '';
@@ -835,11 +924,13 @@ function startDeck() {
     else if (fromUrl) token = fromUrl;                                   // present but malformed -> reported as invalid
     else { try { token = localStorage.getItem(tokenKey) || ''; } catch { /* ignore */ } }
   }
-  let identity = { state: !LINK_MODE ? 'open' : (!token ? 'missing' : (TOKEN_RE.test(token) ? 'checking' : 'invalid')), name: '' };
-  const me = LINK_MODE ? token : getVoterId();
-  const savedKey = 'poll-deck:' + CONFIG.deckId + ':ballot' + (LINK_MODE ? ':' + token : '');
+  let identity = LINK_MODE ? { state: !token ? 'missing' : (TOKEN_RE.test(token) ? 'checking' : 'invalid'), name: '' }
+               : ROSTER_MODE ? { state: 'pick', id: '', name: '', bound: false }
+               : { state: 'open', name: '' };
+  let me = LINK_MODE ? token : (ROSTER_MODE ? '' : getVoterId());
+  const savedKey = 'poll-deck:' + CONFIG.deckId + ':ballot' + (LINK_MODE ? ':' + token : ROSTER_MODE ? ':roster' : '');
   let ballot = { name: '', answers: {} };
-  try {
+  if (!ROSTER_MODE) try {                              // in roster mode the vote is restored from the database, per person
     const sv = JSON.parse(localStorage.getItem(savedKey));
     if (sv && typeof sv.name === 'string' && sv.answers && typeof sv.answers === 'object') ballot = { name: sv.name, answers: sv.answers };
   } catch { /* ignore */ }
@@ -862,9 +953,11 @@ function startDeck() {
         <div class="vb pop" style="--d:.25s">
           <div class="nametag">
             <label class="nt-top" for="name-${esc(q.id)}">Hello, my name is</label>
-            <input class="vb-input" id="name-${esc(q.id)}" type="text" maxlength="40" autocomplete="name" enterkeyhint="done" placeholder="Write your name">
+            <input class="vb-input" id="name-${esc(q.id)}" type="text" maxlength="40" autocomplete="${ROSTER_MODE ? 'off' : 'name'}" enterkeyhint="done" placeholder="Write your name">
           </div>
+          ${ROSTER_MODE ? '<div class="suggest" role="listbox" aria-label="Matching invited names" hidden></div>' : ''}
           <p class="vb-status" role="status"></p>
+          ${ROSTER_MODE ? '<button class="vb-change" type="button" hidden>Not me, choose another name</button>' : ''}
         </div>
       </div>
       <div class="poll-right">
@@ -897,6 +990,7 @@ function startDeck() {
     ref('state-text').textContent = open ? 'Voting open' : 'Voting closed';
     const notes = [];
     if (LINK_MODE && identity.state !== 'ok') notes.push('Voting is only open to invited people. Use the personal link the organizer sent you.');
+    else if (ROSTER_MODE && identity.state !== 'ok') notes.push('Type a keyword of your name and choose yourself from the list to vote.');
     else notes.push('Pick an option to vote. You can change it until voting closes.', 'Your name is shown next to your vote on the results slide.');
     if (!REMOTE) notes.push('Demo mode: votes stay in this browser. Add your Firebase URL to go live.');
     ref('foot').textContent = notes.join(' ');
@@ -960,6 +1054,13 @@ function startDeck() {
       if (LINK_MODE) {                                   // the name comes from the link and cannot be edited
         inp.readOnly = true; inp.value = identity.state === 'ok' ? identity.name : ''; inp.placeholder = PLACEHOLDER[identity.state] || '';
         inp.closest('.nametag').classList.add('locked');
+      } else if (ROSTER_MODE) {                          // type a keyword, pick yourself, then the name is locked
+        const chosen = identity.state === 'ok' || identity.state === 'taken' || identity.state === 'checking';
+        inp.readOnly = chosen; inp.closest('.nametag').classList.toggle('locked', chosen);
+        if (chosen) inp.value = identity.name;
+        inp.placeholder = 'Type your name…';
+        const chg = $('.vb-change', slide); if (chg) chg.hidden = !((identity.state === 'ok' && !identity.bound) || identity.state === 'taken');
+        const sg = $('.suggest', slide); if (sg && chosen) sg.hidden = true;
       } else {
         if (document.activeElement !== inp) inp.value = ballot.name;
         inp.disabled = !voting;
@@ -974,13 +1075,16 @@ function startDeck() {
       case 'invalid': return setMsg('This voting link isn’t valid. Ask the organizer for your own link.', 'err');
       case 'refused': return setMsg('The database refused to check your link. The organizer needs to update the database rules.', 'err');
       case 'error':   return setMsg('Couldn’t check your link yet. Retrying…', 'err');
-      case 'checking': return setMsg('Checking your link…', '');
-      case 'ok': return setMsg(hasVoted() ? 'Voting as ' + identity.name + '. Your vote is recorded. Tap another option to change it.' : 'Voting as ' + identity.name + '. Pick an option to vote.', hasVoted() ? 'ok' : '');
+      case 'checking': return setMsg(ROSTER_MODE ? 'Checking that this name is free…' : 'Checking your link…', '');
+      case 'pick': return setMsg('Type a keyword of your name, then choose yourself from the list.', '');
+      case 'taken': return setMsg(identity.name + ' has already voted from another browser. If that was you, open the deck in that browser. If it was not you, tell the organizer.', 'err');
+      case 'setup': return setMsg(SETUP_MSG[identity.reason] || SETUP_MSG.error, 'err');
+      case 'ok': { const lead = identity.note ? identity.note + ' ' : ''; return setMsg(lead + (hasVoted() ? 'Voting as ' + identity.name + '. Your vote is recorded. Tap another option to change it.' : 'Voting as ' + identity.name + '. Pick an option to vote.'), hasVoted() ? 'ok' : ''); }
       default: return hasVoted() && ballot.name ? setMsg('Your vote is recorded. Tap another option to change it.', 'ok') : setMsg('');
     }
   }
   async function resolveIdentity() {
-    if (identity.state !== 'checking' && identity.state !== 'error') return;
+    if (!LINK_MODE || (identity.state !== 'checking' && identity.state !== 'error')) return;
     try {
       const name = await Store.getAllowed(token);
       if (typeof name === 'string' && name.trim()) { identity = { state: 'ok', name: name.trim() }; ballot.name = identity.name; setConn(true); }
@@ -993,23 +1097,112 @@ function startDeck() {
   }
   /* Same person on another device (or a private window): show the vote they already cast */
   function adoptServerBallot(ballots) {
-    if (!LINK_MODE || identity.state !== 'ok' || sending || Date.now() - lastPutAt < 6000) return;
+    if (!(LINK_MODE || ROSTER_MODE) || identity.state !== 'ok' || sending || Date.now() - lastPutAt < 6000) return;
     const mine = ballots && ballots[me];
     if (!mine || typeof mine.answers !== 'object' || !mine.answers) return;
     const next = {}; QUESTIONS.forEach(q => { if (validAnswer(q, mine.answers[q.id])) next[q.id] = mine.answers[q.id]; });
     if (QUESTIONS.some(q => next[q.id] !== ballot.answers[q.id])) { ballot.answers = next; syncVoterUI(); announce(); }
   }
+  /* ---- shared-link mode: find yourself in the invited list, then the server remembers this browser ---- */
+  let roster = null, suggestSeq = 0;
+  async function loadRoster() {
+    if (roster) return roster;
+    const raw = await Store.getRoster();
+    roster = Object.entries(raw || {}).filter(([, n]) => typeof n === 'string' && n.trim()).map(([id, name]) => {
+      const p = nameParts(name); return { id, name: name.trim(), search: p.tokens.concat(p.detail ? p.detail.split(' ') : []) };
+    });
+    return roster;
+  }
+  const reasonOf = e => {
+    const c = (e && e.code) || '';
+    if (c === 'NO_API_KEY') return 'nokey';
+    if (/OPERATION_NOT_ALLOWED|ADMIN_ONLY_OPERATION/.test(c)) return 'noanon';
+    if (/API_KEY/.test(c)) return 'badkey';
+    return e && (e.status === 401 || e.status === 403) ? 'refused' : 'error';
+  };
+  function setupProblem(e) {
+    const reason = reasonOf(e); identity = { state: 'setup', reason, name: '' };
+    if (reason === 'error') setConn(false);
+    syncVoterUI(); announce();
+  }
+  async function showSuggestions(text) {
+    const my = ++suggestSeq, boxes = $$('.suggest');
+    const clear = () => boxes.forEach(b => { b.hidden = true; b.textContent = ''; });
+    if (cleanName(text).length < 2) return clear();
+    let list; try { list = await loadRoster(); } catch (e) { clear(); return setupProblem(e); }
+    if (my !== suggestSeq) return;
+    if (!list.length) { clear(); identity = { state: 'setup', reason: 'empty', name: '' }; return announce(); }
+    if (identity.state === 'setup') { identity = { state: 'pick', id: '', name: '', bound: false }; announce(); }
+    const found = searchRoster(list, text);
+    boxes.forEach(box => {
+      box.textContent = '';
+      if (!found.length) { const p = document.createElement('p'); p.className = 'none'; p.textContent = 'No invited name matches. Check the spelling, or try another part of your name.'; box.appendChild(p); }
+      else found.forEach(r => { const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'option'); b.dataset.id = r.id; b.textContent = r.name; box.appendChild(b); });
+      box.hidden = false;
+    });
+  }
+  /* Background check after picking a name: is it free, and has this browser already voted as someone else? */
+  async function claimCheck(id, name) {
+    try {
+      const { uid, token: tok } = await Auth.token();
+      const bound = await Store.getBinding(uid, tok);
+      if (bound && bound !== id) {
+        const other = roster && roster.find(x => x.id === bound);
+        identity = { state: 'ok', id: bound, name: other ? other.name : bound, bound: true, note: 'This browser already voted as ' + (other ? other.name : 'another name') + ', so you are voting as that person.' };
+      } else {
+        const b = await Store.getBallot(id);
+        if (b && b.uid && b.uid !== uid) { identity = { state: 'taken', id, name, bound: false }; ballot.answers = {}; }
+        else identity = { state: 'ok', id, name, bound: bound === id };
+      }
+      me = identity.id; ballot.name = identity.name; setConn(true);
+    } catch (e) { return setupProblem(e); }
+    syncVoterUI(); announce(); deckTick();           // refresh now so an existing vote shows up immediately
+  }
+  async function pickPerson(id) {
+    const p = roster && roster.find(x => x.id === id); if (!p) return;
+    ballot = { name: p.name, answers: {} }; identity = { state: 'checking', id, name: p.name, bound: false };
+    $$('.suggest').forEach(b => { b.hidden = true; });
+    syncVoterUI(); announce();
+    await claimCheck(id, p.name);
+  }
+  function changePerson() {
+    if (!(identity.state === 'taken' || (identity.state === 'ok' && !identity.bound))) return;
+    identity = { state: 'pick', id: '', name: '', bound: false }; me = ''; ballot = { name: '', answers: {} };
+    $$('.vb-input').forEach(i => { i.value = ''; });
+    syncVoterUI(); announce();
+    const f = $('.slide.active .vb-input') || $('.vb-input'); if (f) f.focus();
+  }
+  async function resumeIdentity() {                   // a returning browser that already voted: it is still the same person
+    try {
+      await loadRoster();
+      const { uid, token: tok } = await Auth.token();
+      const bound = await Store.getBinding(uid, tok);
+      if (bound) { const p = roster.find(x => x.id === bound); identity = { state: 'ok', id: bound, name: p ? p.name : bound, bound: true }; me = bound; ballot.name = identity.name; }
+    } catch { /* stay on "type your name"; picking a name will report any real problem */ }
+    syncVoterUI(); announce(); deckTick();
+  }
+
   async function submit() {
     if (!ballot.name || !hasVoted()) return;
     const payload = { name: ballot.name, answers: Object.assign({}, ballot.answers), ts: Date.now() };
     sending = true; lastPutAt = Date.now(); setMsg('Sending…');
     try {
-      await Store.putBallot(me, payload);
+      let auth = null;
+      if (ROSTER_MODE) {
+        auth = await Auth.token();
+        if (!identity.bound) { await Store.putBinding(auth.uid, me, auth.token); identity.bound = true; syncVoterUI(); }
+        payload.uid = auth.uid;
+      }
+      await Store.putBallot(me, payload, auth && auth.token);
       try { localStorage.setItem(savedKey, JSON.stringify(payload)); } catch { /* ignore */ }
       lastPutAt = Date.now(); setConn(true);
       setMsg((cheer ? cheer + ' ' : '') + 'Vote recorded for ' + payload.name + '. Tap another option to change it.', 'ok');
     } catch (err) {
-      if (err && (err.status === 401 || err.status === 403)) setMsg('The database refused this vote. Voting has probably closed.', 'err');
+      if (err && (err.status === 401 || err.status === 403)) {
+        if (ROSTER_MODE) { sending = false; await claimCheck(me, identity.name); }              // maybe the name was taken meanwhile
+        if (ROSTER_MODE && identity.state === 'taken') announce();
+        else setMsg('The database refused this vote. Voting has probably closed.', 'err');
+      } else if (ROSTER_MODE && err && err.code) setMsg(SETUP_MSG[reasonOf(err)] || SETUP_MSG.error, 'err');
       else { setConn(false); setMsg('Your vote didn’t go through. Check your connection and tap again.', 'err'); }
     }
     sending = false;
@@ -1019,7 +1212,7 @@ function startDeck() {
     if (!canVote()) return;
     const qid = btn.dataset.q, i = Number(btn.dataset.v), q = qById(qid);
     const input = $('.vb-input', slide);
-    const name = LINK_MODE ? identity.name : cleanName(input ? input.value : ballot.name);
+    const name = (LINK_MODE || ROSTER_MODE) ? identity.name : cleanName(input ? input.value : ballot.name);
     if (!name) { setMsg('Enter your name first, then pick an option.', 'err'); if (input) input.focus(); return; }
     const changed = ballot.answers[qid] !== i;
     ballot.name = name; ballot.answers[qid] = i;
@@ -1027,6 +1220,8 @@ function startDeck() {
     syncVoterUI(); if (changed) fxBurst(btn, btn.dataset.fx); submit();
   }
   stage.addEventListener('click', e => {
+    const sg = e.target.closest('.suggest button'); if (sg) pickPerson(sg.dataset.id);
+    if (e.target.closest('.vb-change')) changePerson();
     const b = e.target.closest('.choice');
     if (b && !b.disabled) vote(b.closest('.slide'), b);
     const pin = e.target.closest('.art-pin');
@@ -1035,6 +1230,7 @@ function startDeck() {
   stage.addEventListener('input', e => {
     if (!e.target.classList.contains('vb-input')) return;
     $$('.vb-input').forEach(o => { if (o !== e.target) o.value = e.target.value; });
+    if (ROSTER_MODE) { if (!e.target.readOnly) showSuggestions(e.target.value); return; }
     if (statusIsError()) setMsg('');
   });
   stage.addEventListener('change', e => {
@@ -1043,6 +1239,21 @@ function startDeck() {
     if (!name) { if (hasVoted()) setMsg('Your name can’t be empty.', 'err'); syncVoterUI(); return; }
     ballot.name = name; syncVoterUI();
     if (hasVoted()) submit();
+  });
+  stage.addEventListener('keydown', e => {                       // keyboard use of the suggestion list
+    if (!ROSTER_MODE) return;
+    const slide = e.target.closest && e.target.closest('.slide'); if (!slide) return;
+    if (e.target.classList && e.target.classList.contains('vb-input')) {
+      const items = $$('.suggest button', slide);
+      if (e.key === 'ArrowDown' && items.length) { e.preventDefault(); items[0].focus(); }
+      else if (e.key === 'Enter' && items.length === 1) { e.preventDefault(); pickPerson(items[0].dataset.id); }
+      else if (e.key === 'Escape') $$('.suggest').forEach(b => { b.hidden = true; });
+    } else if (e.target.closest('.suggest')) {
+      const items = $$('.suggest button', slide), i = items.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') { e.preventDefault(); (items[i + 1] || items[0]).focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); if (i <= 0) $('.vb-input', slide).focus(); else items[i - 1].focus(); }
+      else if (e.key === 'Escape') $('.vb-input', slide).focus();
+    }
   });
   const statusIsError = () => { const el = $('.vb-status'); return !!(el && el.classList.contains('err')); };
 
@@ -1136,6 +1347,7 @@ function startDeck() {
   syncVoterUI();
   announce();
   resolveIdentity();
+  if (ROSTER_MODE && Auth.has()) resumeIdentity();
   paintClock(); setInterval(clockTick, 1000);
 
   /* ---- refresh loop ---- */
@@ -1182,7 +1394,7 @@ function startDeck() {
     $('#pc-toggle').title = late ? 'The deadline has passed. To extend it, change votingCloses in index.html (and in the database rules).' : 'Shortcut: V';
     $('#pc-csv').hidden = !(slides[cur] && slides[cur].hasAttribute('data-results'));
     $('#pc-sample').hidden = REMOTE;
-    $('#pc-reset').hidden = LINK_MODE;               // the rules keep ballots read-only from web pages; clear them in the Firebase console
+    $('#pc-reset').hidden = LINK_MODE || ROSTER_MODE;               // the rules keep ballots read-only from web pages; clear them in the Firebase console
   }
   function toggleVoting() {
     if (MODE !== 'present' || pastDeadline()) return;
@@ -1245,6 +1457,7 @@ function startDeck() {
   window.addEventListener('keydown', e => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.target.matches && e.target.matches('input, textarea, select')) return;   // typing a name
+    if (e.target.closest && e.target.closest('.suggest')) return;                  // arrow keys move through the name list
     const onControl = e.target.closest && e.target.closest('button, a');
     if (onControl && (e.key === ' ' || e.key === 'Enter')) return;
     switch (e.key) {
