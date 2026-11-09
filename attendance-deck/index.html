@@ -836,7 +836,7 @@ const QUESTIONS = [
   },
   {
     id: 'part', title: 'Chicken part', heading: 'Which part of the chicken?',
-    options: [{ name: 'Dada' }, { name: 'Paha Atas' }, { name: 'Paha Bawah' }].map(o => Object.assign(o, { fx: 'confetti', cheer: 'Locked in!' }))
+    options: [{ name: 'Dada' }, { name: 'Paha' }].map(o => Object.assign(o, { fx: 'confetti', cheer: 'Locked in!' }))
   }
 ];
 QUESTIONS.forEach(q => q.options.forEach(o => { o.label = o.label || ((o.emoji ? o.emoji + ' ' : '') + o.name); o.short = o.short || o.name; }));
